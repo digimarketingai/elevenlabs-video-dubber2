@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+cookies.txt
+cookies*.txt
+
+# Generated media and job data
+work/
+.gradio/
+gradio_cached_examples/
+flagged/
+*.log
+
+# Notebook and operating-system files
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
