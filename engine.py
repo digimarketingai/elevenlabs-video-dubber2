@@ -12,6 +12,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,7 +20,6 @@ import requests
 import srt
 from opencc import OpenCC
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from youtube_urls import normalize_youtube_url
 
@@ -32,6 +32,7 @@ API = "https://api.elevenlabs.io/v1"
 
 MAX_SOURCE_BYTES = 500 * 1024 * 1024
 MAX_YOUTUBE_SECONDS = 20 * 60
+MAX_CAPTION_ROWS = 2000
 
 MODEL = None
 CONVERTER = OpenCC("s2t")
@@ -63,15 +64,40 @@ AUDIO_CHOICES = [
 ]
 
 
+# ============================================================
+# Common helpers
+# ============================================================
+
 def safe_error(error, key=""):
+    """Redact credentials and URLs before displaying an error."""
     text = str(error)
 
     if key:
-        text = text.replace(key, "[REDACTED]")
+        text = text.replace(str(key), "[REDACTED]")
+        stripped = str(key).strip().strip("\"'")
+        if stripped:
+            text = text.replace(stripped, "[REDACTED]")
 
-    # Avoid exposing signed storage URLs or long query strings.
+    text = re.sub(
+        r"(?i)\bsk_[A-Za-z0-9_-]+\b",
+        "[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(xi-api-key|authorization)(\s*[:=]\s*)[^\s,;]+",
+        r"\1\2[REDACTED]",
+        text,
+    )
     text = re.sub(r"https?://\S+", "[URL]", text)
-    return text[-1800:]
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    return text[-2400:]
+
+
+def package_version(name):
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "not installed"
 
 
 def run_command(args, cwd=None, timeout=1800):
@@ -89,11 +115,16 @@ def run_command(args, cwd=None, timeout=1800):
         raise RuntimeError(
             "處理逾時 / Processing timed out."
         ) from None
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"找不到執行工具 / Executable not found: {args[0]}"
+        ) from None
 
     if result.returncode:
         detail = safe_error(result.stderr or result.stdout)
         raise RuntimeError(
-            "處理失敗 / Processing failed:\n" + detail
+            f"工具執行失敗 / Tool exited with code "
+            f"{result.returncode}:\n{detail}"
         )
 
     return result.stdout
@@ -124,11 +155,18 @@ def probe(path):
 
 
 def duration(path):
-    value = float(probe(path)["format"]["duration"])
+    data = probe(path)
+
+    try:
+        value = float(data["format"]["duration"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            "無法讀取媒體長度 / Cannot determine media duration."
+        ) from None
 
     if not math.isfinite(value) or value <= 0:
         raise ValueError(
-            "無法讀取有效媒體長度 / Invalid media duration."
+            "無效媒體長度 / Invalid media duration."
         )
 
     return value
@@ -141,36 +179,159 @@ def save_job(job):
     destination = Path(job["directory"]) / "job.json"
     temporary = destination.with_suffix(".tmp")
 
+    # The API key is never added to the job dictionary by this module.
     temporary.write_text(
         json.dumps(job, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
     temporary.replace(destination)
 
 
-# ------------------------------------------------------------
-# YouTube
-# ------------------------------------------------------------
+# ============================================================
+# YouTube environment and diagnostics
+# ============================================================
+
+def find_deno():
+    executable = shutil.which("deno")
+    if executable:
+        return executable
+
+    locations = [
+        Path.home() / ".deno" / "bin" / "deno",
+    ]
+
+    configured = os.environ.get("DENO_INSTALL", "").strip()
+    if configured:
+        locations.insert(
+            0,
+            Path(configured).expanduser() / "bin" / "deno",
+        )
+
+    for candidate in locations:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    return None
+
 
 def ytdlp_base():
+    if package_version("yt-dlp") == "not installed":
+        raise RuntimeError(
+            "目前 Python 環境未安裝 yt-dlp。 / "
+            "yt-dlp is not installed in the app's Python environment."
+        )
+
     args = [
         sys.executable,
         "-m", "yt_dlp",
         "--ignore-config",
         "--no-playlist",
         "--no-progress",
+        "--no-colors",
         "--socket-timeout", "25",
         "--retries", "2",
         "--fragment-retries", "2",
     ]
 
-    if shutil.which("deno"):
-        args += ["--js-runtimes", "deno"]
-    elif shutil.which("node"):
-        args += ["--js-runtimes", "node"]
+    deno = find_deno()
+    node = shutil.which("node")
+
+    if deno:
+        args += ["--js-runtimes", f"deno:{deno}"]
+    elif node:
+        args += ["--js-runtimes", f"node:{node}"]
+    else:
+        raise RuntimeError(
+            "找不到 Deno 或 Node JavaScript runtime。"
+            "請重新執行 colab.sh 安裝 Deno。 / "
+            "No Deno or Node runtime found. "
+            "Run colab.sh to install Deno."
+        )
 
     return args
+
+
+def youtube_error_message(error, video_id, stage):
+    detail = safe_error(error)
+    lower = detail.lower()
+
+    if (
+        "sign in" in lower
+        or "not a bot" in lower
+        or "login required" in lower
+    ):
+        reason = (
+            "服務要求登入或驗證，或目前主機受到存取限制。 / "
+            "The response requests sign-in/verification or indicates "
+            "an access restriction."
+        )
+    elif (
+        "private video" in lower
+        or "members-only" in lower
+        or "members only" in lower
+    ):
+        reason = (
+            "回應指出影片有私人或會員存取限制。 / "
+            "The response indicates private or members-only access."
+        )
+    elif "not available in your country" in lower:
+        reason = (
+            "回應指出目前執行主機所在區域無法存取。 / "
+            "The response indicates a regional restriction."
+        )
+    elif "video unavailable" in lower:
+        reason = (
+            "YouTube 對目前執行環境回傳 Video unavailable。"
+            "僅憑這段訊息無法判定影片已刪除；"
+            "也可能與存取限制或下載器相容性有關。 / "
+            "YouTube returned Video unavailable to this environment. "
+            "This alone does not prove deletion; access restrictions "
+            "or extractor compatibility may also be involved."
+        )
+    elif "429" in lower or "too many requests" in lower:
+        reason = (
+            "回應指出請求過多，請停止重複嘗試並稍後再試。 / "
+            "The response indicates rate limiting. "
+            "Stop repeated attempts and try later."
+        )
+    elif "403" in lower:
+        reason = (
+            "伺服器拒絕目前請求。 / "
+            "The server refused this request."
+        )
+    elif (
+        "javascript" in lower
+        or "challenge" in lower
+        or "ejs" in lower
+    ):
+        reason = (
+            "請檢查 yt-dlp、EJS 套件及 JavaScript runtime。 / "
+            "Check yt-dlp, its EJS package, and the JavaScript runtime."
+        )
+    else:
+        reason = (
+            "目前無法完成 YouTube 操作；請參考下方診斷。 / "
+            "The YouTube operation failed; see the diagnostic below."
+        )
+
+    return (
+        f"YouTube {stage}失敗 / YouTube operation failed\n"
+        f"影片 ID / Video ID: {video_id}\n"
+        f"yt-dlp: {package_version('yt-dlp')}\n"
+        f"yt-dlp-ejs: {package_version('yt-dlp-ejs')}\n\n"
+        f"{reason}\n\n"
+        "建議 / Next steps:\n"
+        "1. 在一般瀏覽器確認此影片是否可以播放。\n"
+        "   Check playback in your normal browser.\n"
+        "2. 更新本工具 .venv 內的 yt-dlp[default]。\n"
+        "   Update yt-dlp[default] inside this app's .venv.\n"
+        "3. 若瀏覽器可播但 Colab 仍失敗，請使用您有權使用的"
+        "本機影片，或在自己的電腦執行工具。\n"
+        "   If browser playback works but Colab fails, upload an "
+        "authorized local file or run the app on your own computer.\n\n"
+        "診斷 / Diagnostic:\n"
+        + detail[-1200:]
+    )
 
 
 def inspect_youtube(url):
@@ -190,27 +351,39 @@ def inspect_youtube(url):
         )
     except Exception as exc:
         raise RuntimeError(
-            "網址格式有效，但 YouTube 可用性檢查失敗。"
-            "可能需要登入、影片已移除，或目前網路遭到阻擋。"
-            "請改用您有權使用的本機影片。 / "
-            "URL format is valid, but YouTube availability checking failed. "
-            "The video may require sign-in, be unavailable, or be blocked "
-            "from this network. Upload an authorized local video instead.\n"
-            + safe_error(exc)
+            youtube_error_message(
+                exc, normalized.video_id, "可用性檢查"
+            )
         ) from None
 
-    seconds = float(metadata.get("duration") or 0)
+    if not isinstance(metadata, dict):
+        raise RuntimeError(
+            "YouTube 回傳無效影片資訊 / Invalid YouTube metadata."
+        )
+
+    try:
+        seconds = float(metadata.get("duration") or 0)
+    except (TypeError, ValueError):
+        seconds = 0
 
     if (
         metadata.get("is_live")
         or metadata.get("live_status") in {"is_live", "is_upcoming"}
-        or not math.isfinite(seconds)
-        or seconds <= 0
-        or seconds > MAX_YOUTUBE_SECONDS
     ):
         raise ValueError(
-            "本工具僅接受已發布、非直播且不超過 20 分鐘的影片。 / "
-            "This app accepts available, non-live videos up to 20 minutes."
+            "不接受正在直播或尚未開始的直播。 / "
+            "Active or upcoming live streams are not supported."
+        )
+
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(
+            "無法確認影片長度。 / Cannot determine video duration."
+        )
+
+    if seconds > MAX_YOUTUBE_SECONDS:
+        raise ValueError(
+            "YouTube 來源影片不可超過 20 分鐘。 / "
+            "YouTube source videos must be at most 20 minutes."
         )
 
     return normalized, metadata
@@ -235,7 +408,6 @@ def download_youtube(url, directory, emit):
                     "b[height<=1280][width<=1280]"
                 ),
                 "--merge-output-format", "mp4",
-                # This applies per download, not to all temporary files.
                 "--max-filesize", "250M",
                 "-o", str(directory / "source.%(ext)s"),
                 normalized.canonical,
@@ -244,21 +416,22 @@ def download_youtube(url, directory, emit):
         )
     except Exception as exc:
         raise RuntimeError(
-            "YouTube 下載失敗；網址有效不代表一定能下載。"
-            "請改用本機上傳。 / "
-            "YouTube download failed; a valid URL does not guarantee "
-            "download access. Use a local upload.\n"
-            + safe_error(exc)
+            youtube_error_message(
+                exc, normalized.video_id, "下載"
+            )
         ) from None
 
     candidates = [
         path for path in directory.glob("source.*")
         if path.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}
+        and path.is_file()
     ]
 
     if not candidates:
         raise RuntimeError(
-            "找不到下載影片 / No downloaded video was found."
+            "未取得影片檔案，下載可能因大小限制而跳過。 / "
+            "No video file was produced. "
+            "The download may have been skipped by the size limit."
         )
 
     source = max(candidates, key=lambda path: path.stat().st_size)
@@ -269,82 +442,312 @@ def download_youtube(url, directory, emit):
     }
 
 
-# ------------------------------------------------------------
-# ElevenLabs
-# ------------------------------------------------------------
+# ============================================================
+# ElevenLabs authentication and safe error reporting
+# ============================================================
 
-def api_session(key):
-    key = str(key or "").strip()
+class ElevenLabsAPIError(RuntimeError):
+    def __init__(self, http_status, provider_status, message):
+        self.http_status = http_status
+        self.provider_status = provider_status
+        super().__init__(message)
+
+
+def normalize_api_key(value):
+    key = str(value or "").strip()
+
+    # Accept a key accidentally wrapped in matching ASCII quotes.
+    if (
+        len(key) >= 2
+        and key[0] == key[-1]
+        and key[0] in {"'", '"'}
+    ):
+        key = key[1:-1].strip()
 
     if not key:
         raise ValueError(
-            "請輸入 ElevenLabs API 金鑰 / Enter an ElevenLabs API key."
+            "請輸入 ElevenLabs API 金鑰。 / "
+            "Enter your ElevenLabs API key."
         )
 
+    if key.lower().startswith(("bearer ", "xi-api-key:")):
+        raise ValueError(
+            "請只貼上金鑰本身，不要包含 Bearer 或 xi-api-key:。 / "
+            "Paste only the key, without Bearer or xi-api-key:."
+        )
+
+    if (
+        any(char.isspace() for char in key)
+        or not key.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in key)
+        or "*" in key
+        or "..." in key
+    ):
+        raise ValueError(
+            "金鑰含空白、非 ASCII 字元或遮蔽符號。"
+            "請重新複製完整金鑰，不要貼上遮蔽後的顯示文字。 / "
+            "The key contains whitespace, non-ASCII characters, "
+            "or masking symbols. Copy the complete secret key."
+        )
+
+    # Do not enforce a particular prefix or fixed key length.
+    return key
+
+
+def api_session(key):
+    key = normalize_api_key(key)
+
     session = requests.Session()
-    session.headers["xi-api-key"] = key
+    session.headers.update({
+        "xi-api-key": key,
+        "Accept": "application/json",
+    })
 
-    # GET retries only. Never automatically retry paid POST requests.
-    retries = Retry(
-        total=2,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET"]),
-        respect_retry_after_header=True,
-    )
-
-    session.mount(
-        "https://",
-        HTTPAdapter(max_retries=retries),
-    )
+    # Disable transport retries for every method.
+    # api_json explicitly retries selected GET failures only.
+    session.mount("https://", HTTPAdapter(max_retries=0))
+    session.mount("http://", HTTPAdapter(max_retries=0))
 
     return session
 
 
-def api_json(session, method, path, **kwargs):
-    timeout = kwargs.pop("timeout", (20, 180))
+def extract_provider_error(response, key):
+    """Read selected JSON fields, never expose the entire response body."""
+    code = ""
+    message = ""
 
     try:
-        response = session.request(
-            method,
-            API + path,
-            timeout=timeout,
-            allow_redirects=False,
-            **kwargs,
-        )
-    except requests.RequestException:
-        extra = ""
+        data = response.json()
+    except ValueError:
+        data = None
 
-        if method == "POST":
-            extra = (
-                " 伺服器可能已接受專案；請先檢查帳戶，避免重複扣款。 / "
-                "The server may already have accepted the project. "
-                "Check your account before creating another."
+    if isinstance(data, dict):
+        detail = data.get("detail", data)
+
+        if isinstance(detail, dict):
+            raw_code = detail.get("status") or detail.get("code") or ""
+            raw_message = detail.get("message") or ""
+
+            if isinstance(raw_code, str):
+                code = raw_code
+
+            if isinstance(raw_message, str):
+                message = raw_message
+
+        elif isinstance(detail, str):
+            message = detail
+
+    code = safe_error(code, key)[:120]
+    message = safe_error(message, key)[:800]
+
+    return code, message
+
+
+def api_error_hint(http_status, provider_status):
+    code = provider_status.lower()
+
+    if "permission" in code or "scope" in code:
+        return (
+            "此金鑰缺少所呼叫端點的權限。"
+            "請在 ElevenLabs API Keys 設定檢查對應權限；"
+            "訂閱讀取與配音權限可能不同。 / "
+            "This key lacks permission for the requested endpoint. "
+            "Check its API-key scopes; subscription and dubbing "
+            "permissions may differ."
+        )
+
+    if "quota" in code or "credit" in code:
+        return (
+            "服務回報額度或 credit 限制。"
+            "請檢查工作區額度、金鑰額度限制及帳戶設定。 / "
+            "The service reports a quota or credit restriction. "
+            "Check workspace usage, key limits, and account settings."
+        )
+
+    if http_status == 401:
+        return (
+            "此請求未通過驗證。請重新複製完整有效的 ElevenLabs "
+            "API 金鑰，確認未停用或撤銷，並檢查下方服務訊息。"
+            "401 本身不能證明額度不足。 / "
+            "Authentication was rejected. Copy a complete active "
+            "ElevenLabs API key and inspect the provider message. "
+            "HTTP 401 alone does not establish exhausted allowance."
+        )
+
+    if http_status == 403:
+        return (
+            "請求被拒絕。請檢查服務訊息、端點權限、"
+            "工作區政策及金鑰 IP 限制。 / "
+            "Access was denied. Check the provider message, scopes, "
+            "workspace policy, and API-key IP restrictions."
+        )
+
+    if http_status == 429:
+        return (
+            "請求受到限流。請稍後再試。 / "
+            "The request was rate limited. Try again later."
+        )
+
+    if http_status in {400, 422}:
+        return (
+            "服務拒絕請求參數，請檢查服務訊息。 / "
+            "The service rejected the request parameters."
+        )
+
+    if http_status == 404:
+        return (
+            "找不到端點或資源，或目前金鑰無法存取該資源。 / "
+            "The endpoint/resource was not found or is inaccessible."
+        )
+
+    if http_status >= 500:
+        return (
+            "服務端錯誤；若為建立專案請求，"
+            "請先檢查帳戶再決定是否重試。 / "
+            "Server error. For project creation, check your account "
+            "before deciding whether to try again."
+        )
+
+    return (
+        "請參考服務訊息；不要反覆建立付費專案。 / "
+        "Review the provider message; do not repeatedly create paid jobs."
+    )
+
+
+def api_json(session, method, path, **kwargs):
+    method = method.upper()
+    timeout = kwargs.pop("timeout", (20, 180))
+    key = session.headers.get("xi-api-key", "")
+
+    # Three total attempts for GET; exactly one for POST and others.
+    attempts = 3 if method == "GET" else 1
+    retry_statuses = {429, 500, 502, 503, 504}
+
+    for attempt in range(attempts):
+        try:
+            response = session.request(
+                method,
+                API + path,
+                timeout=timeout,
+                allow_redirects=False,
+                **kwargs,
+            )
+        except requests.RequestException:
+            if method == "GET" and attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+                continue
+
+            message = (
+                "ElevenLabs 連線失敗或逾時。 / "
+                "ElevenLabs connection failed or timed out."
             )
 
-        raise RuntimeError(
-            "ElevenLabs 連線失敗 / ElevenLabs connection failed."
-            + extra
-        ) from None
+            if method == "POST":
+                message += (
+                    "\n建立結果可能不明；伺服器可能已接受請求。"
+                    "本工具沒有自動重送。請先檢查 ElevenLabs 帳戶。 / "
+                    "The server may already have accepted the request. "
+                    "No automatic retry was made. Check ElevenLabs first."
+                )
 
-    if not 200 <= response.status_code < 300:
-        raise RuntimeError(
-            f"ElevenLabs HTTP {response.status_code}："
-            "請檢查金鑰、權限、方案及額度。 / "
-            "Check your API key, permissions, plan, and allowance."
-        )
+            raise RuntimeError(message) from None
 
-    try:
-        return response.json()
-    except ValueError:
-        raise RuntimeError(
-            "ElevenLabs 回傳非 JSON 資料 / Invalid ElevenLabs JSON response."
-        ) from None
+        status = response.status_code
+
+        if (
+            method == "GET"
+            and status in retry_statuses
+            and attempt + 1 < attempts
+        ):
+            # Respect short numeric Retry-After values.
+            # For longer/date-formatted instructions, return the error
+            # rather than retrying earlier than instructed.
+            header = response.headers.get("Retry-After", "")
+            delay = float(1 + attempt)
+
+            if header:
+                try:
+                    requested_delay = float(header)
+                except ValueError:
+                    requested_delay = None
+
+                if (
+                    requested_delay is None
+                    or not math.isfinite(requested_delay)
+                    or requested_delay < 0
+                    or requested_delay > 15
+                ):
+                    can_retry = False
+                else:
+                    can_retry = True
+                    delay = max(delay, requested_delay)
+            else:
+                can_retry = True
+
+            if can_retry:
+                response.close()
+                time.sleep(delay)
+                continue
+
+        if not 200 <= status < 300:
+            provider_status, provider_message = extract_provider_error(
+                response, key
+            )
+            response.close()
+
+            parts = [
+                f"ElevenLabs HTTP {status}",
+                f"端點 / Endpoint: {method} {path}",
+                api_error_hint(status, provider_status),
+            ]
+
+            if provider_status:
+                parts.append(
+                    "服務錯誤代碼 / Provider status: " + provider_status
+                )
+
+            if provider_message:
+                parts.append(
+                    "服務訊息 / Provider message: " + provider_message
+                )
+
+            if method == "POST":
+                parts.append(
+                    "此 POST 未自動重送。 / This POST was not retried."
+                )
+
+            raise ElevenLabsAPIError(
+                status,
+                provider_status,
+                "\n".join(parts),
+            )
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise RuntimeError(
+                "ElevenLabs 回傳非 JSON 資料。 / "
+                "ElevenLabs returned invalid JSON."
+            ) from None
+        finally:
+            response.close()
+
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "ElevenLabs 回傳結構與預期不同。 / "
+                "Unexpected ElevenLabs response structure."
+            )
+
+        return data
+
+    raise RuntimeError("Request did not complete.")
 
 
 def quota_html(key):
     try:
-        with api_session(key) as session:
+        clean_key = normalize_api_key(key)
+
+        with api_session(clean_key) as session:
             data = api_json(
                 session,
                 "GET",
@@ -356,20 +759,33 @@ def quota_html(key):
         limit = int(data["character_limit"])
 
         if used < 0 or limit < 0:
-            raise ValueError("Invalid quota")
+            raise ValueError(
+                "服務回傳無效額度 / Invalid allowance response."
+            )
 
         remaining = max(0, limit - used)
         percent = min(100, used / limit * 100) if limit else 0
 
         tier = html.escape(str(data.get("tier", "—")))
         status = html.escape(str(data.get("status", "—")))
+        extension = html.escape(
+            str(data.get("max_credit_limit_extension", "Not provided"))
+        )
 
-        timestamp = datetime.now(timezone.utc).strftime(
+        refreshed = datetime.now(timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         )
 
-        extension = data.get("max_credit_limit_extension", "未提供 / Not provided")
-        extension = html.escape(str(extension))
+        reset_text = "未提供 / Not provided"
+        reset = data.get("next_character_count_reset_unix")
+
+        if reset is not None:
+            try:
+                reset_text = datetime.fromtimestamp(
+                    float(reset), timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
 
         return f"""
         <div class="quota-card">
@@ -382,50 +798,69 @@ def quota_html(key):
             <div><b>{tier}</b><small>方案 / Plan</small></div>
           </div>
           <progress value="{percent:.2f}" max="100"></progress>
-          <p>帳戶狀態 / Account status: {status}<br>
-          額外用量上限設定 / Overage cap setting: {extension}</p>
+          <p>
+            帳戶狀態 / Account status: {status}<br>
+            額外用量上限設定 / Overage cap setting: {extension}<br>
+            下次重設 / Next reset: {reset_text}
+          </p>
           <small>
-            更新 / Updated: {timestamp}<br>
-            依 API 的 character_count / character_limit 計算，
-            不是 LLM Token，也不是保證可花費的總額。<br>
-            Based on API character_count / character_limit,
-            not LLM tokens or a guaranteed total spending limit.
-            API-key caps and other account restrictions may differ.
+            更新 / Updated: {refreshed}<br>
+            依 character_count / character_limit 計算，
+            不是 LLM Token、現金餘額或保證可花費的總額。<br>
+            Based on character_count / character_limit,
+            not LLM tokens, cash, or a guaranteed spending balance.
           </small>
         </div>
         """
 
     except Exception as exc:
-        message = html.escape(safe_error(exc, str(key or "")))
+        message = html.escape(
+            safe_error(exc, str(key or ""))
+        ).replace("\n", "<br>")
 
-        return (
-            '<div class="quota-card">'
-            "<b>無法讀取額度 / Allowance unavailable</b>"
-            f"<p>{message}</p>"
-            "<small>額度查詢需要帳戶讀取權限；"
-            "配音權限與額度查詢權限可能不同。 / "
-            "Subscription access is required; "
-            "dubbing permissions may differ.</small>"
-            "</div>"
-        )
+        return f"""
+        <div class="quota-card failure">
+          <b>無法讀取額度 / Allowance unavailable</b>
+          <p>{message}</p>
+          <small>
+            查詢失敗不會顯示假餘額，也不會建立配音專案。<br>
+            A failed lookup does not invent a balance
+            or create a dubbing project.<br>
+            請勿將 API 金鑰貼到公開訊息或截圖。<br>
+            Never share your API key in messages or screenshots.
+          </small>
+        </div>
+        """
 
 
 def fetch_audio(url, output):
     parsed = urlsplit(url)
 
-    if parsed.scheme != "https" or not parsed.hostname:
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise RuntimeError(
             "無效音訊下載網址 / Invalid audio download URL."
         )
 
-    # Deliberately use a separate request without xi-api-key.
+    # Separate session: never send xi-api-key to storage URLs.
     try:
         with requests.get(
             url,
             stream=True,
             timeout=(20, 180),
+            allow_redirects=False,
         ) as response:
-            response.raise_for_status()
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"音訊下載 HTTP {response.status_code}。"
+                    "請按繼續查詢取得新的下載資訊。 / "
+                    "Audio download failed. Use Resume."
+                )
+
             received = 0
 
             with output.open("wb") as file:
@@ -449,9 +884,9 @@ def fetch_audio(url, output):
         ) from None
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Media preparation
-# ------------------------------------------------------------
+# ============================================================
 
 def prepare(job, config, emit):
     if not config["permission"]:
@@ -463,9 +898,7 @@ def prepare(job, config, emit):
     length = float(config["length"] or 20)
 
     if not math.isfinite(start) or start < 0:
-        raise ValueError(
-            "開始時間無效 / Invalid start time."
-        )
+        raise ValueError("開始時間無效 / Invalid start time.")
 
     if not math.isfinite(length) or not 5 <= length <= 120:
         raise ValueError(
@@ -474,26 +907,24 @@ def prepare(job, config, emit):
 
     directory = Path(tempfile.mkdtemp(prefix="v2_", dir=WORK))
 
-    job.clear()
-    job.update({
+    # Keep the previous job if downloading/preparing the new one fails.
+    prepared = {
         "directory": str(directory),
         "original_rows": [],
         "translated_rows": [],
-    })
+    }
 
     if config["input_mode"] == "youtube":
         source, metadata = download_youtube(
             config["url"], directory, emit
         )
-        job.update(metadata)
+        prepared.update(metadata)
     else:
         if not config["upload"]:
-            raise ValueError(
-                "請先上傳影片 / Upload a video first."
-            )
+            raise ValueError("請先上傳影片 / Upload a video first.")
 
         source = Path(config["upload"])
-        job["title"] = source.name
+        prepared["title"] = source.name
 
     if not source.is_file() or source.stat().st_size > MAX_SOURCE_BYTES:
         raise ValueError(
@@ -524,9 +955,8 @@ def prepare(job, config, emit):
     clip = directory / "original.mp4"
     audio = directory / "original.m4a"
 
-    emit("準備影片；保留橫向或直向比例 / Preparing landscape or portrait clip")
+    emit("準備影片 / Preparing clip")
 
-    # Bounding square preserves portrait Shorts without stretching.
     video_filter = (
         f"scale=w='min({edge},iw)':h='min({edge},ih)':"
         "force_original_aspect_ratio=decrease:"
@@ -559,7 +989,7 @@ def prepare(job, config, emit):
         audio,
     ])
 
-    job.update({
+    prepared.update({
         "clip": str(clip),
         "source_audio": str(audio),
         "duration": duration(clip),
@@ -569,27 +999,30 @@ def prepare(job, config, emit):
         ),
     })
 
-    save_job(job)
+    save_job(prepared)
+    job.clear()
+    job.update(prepared)
 
-    # Delete downloaded source fragments after successful preparation.
     if config["input_mode"] == "youtube":
         for path in directory.glob("source.*"):
             if path.is_file():
                 path.unlink(missing_ok=True)
 
 
+# ============================================================
+# Dubbing
+# ============================================================
+
 def create_dub(job, config, emit):
     if not job.get("clip"):
-        raise ValueError(
-            "請先準備影片 / Prepare a clip first."
-        )
+        raise ValueError("請先準備影片 / Prepare a clip first.")
 
     if job.get("project_id") or job.get("creation_uncertain"):
         raise ValueError(
-            "此片段已有專案或建立結果不明。請使用繼續查詢，"
-            "或先在 ElevenLabs 確認，再重新準備片段。 / "
-            "This clip already has a project or an uncertain creation result. "
-            "Use Resume, or check ElevenLabs before preparing another clip."
+            "已有專案或建立結果不明。請使用繼續查詢，"
+            "或先在 ElevenLabs 確認後再準備新片段。 / "
+            "A project exists or creation is uncertain. "
+            "Use Resume or check ElevenLabs before preparing another clip."
         )
 
     if not config["permission"] or not config["paid"]:
@@ -599,14 +1032,18 @@ def create_dub(job, config, emit):
 
     target = config["target"]
 
+    if target not in {code for _, code in LANGUAGES}:
+        raise ValueError("無效目標語言 / Invalid target language.")
+
     if target == job.get("source_language"):
         raise ValueError(
             "來源與目標語言不可相同 / Source and target languages must differ."
         )
 
-    with api_session(config["key"]) as session:
-        emit("建立付費配音專案 / Creating paid dubbing project")
+    # Validate locally before setting the creation-uncertain marker.
+    key = normalize_api_key(config["key"])
 
+    with api_session(key) as session:
         data = {
             "reference": "digimarketingai Video Dubber v2",
             "model_id": "dubbing_v2",
@@ -616,30 +1053,47 @@ def create_dub(job, config, emit):
         if job.get("source_language"):
             data["source_language"] = job["source_language"]
 
-        job["target_language"] = target
-
-        # Set before POST so an uncertain network result cannot be
-        # accidentally retried through this session.
-        job["creation_uncertain"] = True
-        save_job(job)
-
         with open(job["source_audio"], "rb") as file:
-            result = api_json(
-                session,
-                "POST",
-                "/dubbing/project",
-                data=data,
-                files={
-                    "file": ("audio.m4a", file, "audio/mp4")
-                },
-                timeout=(30, 300),
+            job["target_language"] = target
+            job["creation_uncertain"] = True
+            save_job(job)
+
+            emit("建立付費配音專案 / Creating paid dubbing project")
+
+            try:
+                result = api_json(
+                    session,
+                    "POST",
+                    "/dubbing/project",
+                    data=data,
+                    files={
+                        "file": ("audio.m4a", file, "audio/mp4")
+                    },
+                    timeout=(30, 300),
+                )
+            except ElevenLabsAPIError as exc:
+                # Explicit client-side rejection: permit a later manual
+                # attempt after the user fixes the issue.
+                # Never automatically retry the POST.
+                if exc.http_status in {400, 401, 403, 404, 422, 429}:
+                    job["creation_uncertain"] = False
+                    save_job(job)
+                raise
+
+        project_id = result.get("project_id")
+
+        if not isinstance(project_id, str) or not project_id:
+            raise RuntimeError(
+                "建立回應沒有有效 project_id；建立結果不明。"
+                "請先檢查 ElevenLabs 帳戶。 / "
+                "Creation returned no valid project_id. "
+                "Check ElevenLabs before creating another project."
             )
 
-        job["project_id"] = result["project_id"]
+        job["project_id"] = project_id
         job["creation_uncertain"] = False
 
         language_ids = result.get("language_ids") or []
-
         if language_ids:
             job["language_id"] = language_ids[0]
 
@@ -653,9 +1107,9 @@ def resume_dub(job, config, emit):
     if not job.get("clip") or not job.get("project_id"):
         raise ValueError(
             "目前工作階段沒有可繼續的專案。"
-            "若建立請求逾時且沒有 ID，請先檢查 ElevenLabs 帳戶。 / "
-            "No resumable project in this session. If creation timed out "
-            "without an ID, check your ElevenLabs account."
+            "若建立請求逾時且沒有 ID，請先檢查 ElevenLabs。 / "
+            "No resumable project in this session. "
+            "If creation timed out without an ID, check ElevenLabs."
         )
 
     if job.get("dub_video") and Path(job["dub_video"]).is_file():
@@ -676,12 +1130,11 @@ def resume_dub(job, config, emit):
             if project.get("status") == "failed":
                 raise RuntimeError(
                     "配音專案失敗，請檢查 ElevenLabs。 / "
-                    "Dubbing project failed. Check ElevenLabs."
+                    "The dubbing project failed. Check ElevenLabs."
                 )
 
             if not job.get("language_id"):
                 ids = project.get("language_ids") or []
-
                 if ids:
                     job["language_id"] = ids[0]
                     save_job(job)
@@ -690,13 +1143,11 @@ def resume_dub(job, config, emit):
 
             if job.get("language_id"):
                 language_id = job["language_id"]
-
                 target_data = api_json(
                     session,
                     "GET",
                     f"/dubbing/project/{project_id}/language/{language_id}",
                 )
-
                 target_status = target_data.get("status", "unknown")
 
             current = (
@@ -722,14 +1173,14 @@ def resume_dub(job, config, emit):
 
         else:
             raise TimeoutError(
-                "已查詢 30 分鐘；雲端可能仍在處理。請按繼續查詢。 / "
-                "Polling stopped after 30 minutes; the cloud job may still "
-                "be running. Use Resume."
+                "已查詢約 30 分鐘；雲端可能仍在處理。"
+                "請按繼續查詢。 / "
+                "Polling stopped after about 30 minutes. Use Resume."
             )
 
     url = ((target_data or {}).get("outputs") or {}).get("lossless_audio")
 
-    if not url:
+    if not isinstance(url, str) or not url:
         raise RuntimeError(
             "完成的專案未提供音訊 / Completed target has no audio output."
         )
@@ -745,15 +1196,15 @@ def resume_dub(job, config, emit):
 
     if abs(audio_duration - job["duration"]) > 1:
         emit(
-            "提醒：配音與影片長度不同；較長音訊會裁切，較短音訊會補靜音。 / "
-            "Warning: durations differ; longer audio is trimmed and "
-            "shorter audio is padded with silence."
+            "配音長度與影片不同；將裁切或補靜音。 / "
+            "Dub duration differs; audio will be trimmed or padded."
         )
 
     emit("合併影片與配音 / Assembling dubbed video")
 
     ffmpeg([
         "-i", job["clip"],
+        "-protocol_whitelist", "file,pipe",
         "-i", audio,
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -771,9 +1222,9 @@ def resume_dub(job, config, emit):
     save_job(job)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Subtitle recognition and validation
-# ------------------------------------------------------------
+# ============================================================
 
 def plain_text(value):
     text = str(value or "").replace("\x00", "").replace("\r", "")
@@ -817,10 +1268,10 @@ def validate_rows(rows, limit=None):
         if end > start:
             output.append([start, end, plain_text(row[2])])
 
-    if len(output) > 2000:
-        raise ValueError(
-            "字幕最多 2,000 列 / Maximum 2,000 subtitle rows."
-        )
+        if len(output) > MAX_CAPTION_ROWS:
+            raise ValueError(
+                "字幕最多 2,000 列 / Maximum 2,000 subtitle rows."
+            )
 
     return sorted(output, key=lambda row: (row[0], row[1]))
 
@@ -906,9 +1357,7 @@ def transcribe(path, language, traditional, emit):
 
 def generate_captions(job, config, emit, replace=False):
     if not job.get("clip"):
-        raise ValueError(
-            "請先準備影片 / Prepare a clip first."
-        )
+        raise ValueError("請先準備影片 / Prepare a clip first.")
 
     if replace or not job.get("original_rows"):
         emit("產生原文字幕 / Generating original captions")
@@ -927,7 +1376,7 @@ def generate_captions(job, config, emit, replace=False):
     if job.get("dub_video") and (
         replace or not job.get("translated_rows")
     ):
-        emit("從配音辨識翻譯字幕 / Transcribing translated captions from dub")
+        emit("從配音辨識翻譯字幕 / Transcribing captions from dub")
 
         job["translated_rows"] = validate_rows(
             transcribe(
@@ -943,16 +1392,12 @@ def generate_captions(job, config, emit, replace=False):
 
 def import_srt(path):
     if not path:
-        raise ValueError(
-            "請上傳 SRT / Upload an SRT file."
-        )
+        raise ValueError("請上傳 SRT / Upload an SRT file.")
 
     path = Path(path)
 
     if path.stat().st_size > 2 * 1024 * 1024:
-        raise ValueError(
-            "SRT 上限為 2 MB / SRT limit is 2 MB."
-        )
+        raise ValueError("SRT 上限為 2 MB / SRT limit is 2 MB.")
 
     content = path.read_text(encoding="utf-8-sig")
 
@@ -973,11 +1418,16 @@ def combine_rows(original, translated, mode, limit):
     original = validate_rows(original, limit)
     translated = validate_rows(translated, limit)
 
-    selected = {
+    choices = {
         "original": original,
         "translated": translated,
         "bilingual": original + translated,
-    }[mode]
+    }
+
+    if mode not in choices:
+        raise ValueError("無效字幕模式 / Invalid subtitle mode.")
+
+    selected = choices[mode]
 
     if not selected:
         raise ValueError(
@@ -1009,11 +1459,14 @@ def combine_rows(original, translated, mode, limit):
     return output
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Export
-# ------------------------------------------------------------
+# ============================================================
 
 def selected_video(job, audio_mode):
+    if audio_mode not in {"dubbed", "original"}:
+        raise ValueError("無效音訊模式 / Invalid audio mode.")
+
     path = job.get(
         "dub_video" if audio_mode == "dubbed" else "clip"
     )
@@ -1058,7 +1511,12 @@ def ass_time(seconds):
 
 
 def write_ass(path, rows, width, height, font_size):
-    size = max(12, round(float(font_size) * min(width, height) / 720))
+    font_size = float(font_size)
+
+    if not math.isfinite(font_size) or not 18 <= font_size <= 54:
+        raise ValueError("無效字幕字級 / Invalid subtitle font size.")
+
+    size = max(12, round(font_size * min(width, height) / 720))
     margin = max(14, round(min(width, height) * 0.045))
 
     header = f"""[Script Info]
@@ -1141,6 +1599,7 @@ def export_video(job, config, emit):
             f"{html.escape(text, quote=False)}"
             for start, end, text in rows
         ]
+
         path.write_text(
             "WEBVTT\n\n" + "\n\n".join(blocks) + "\n",
             encoding="utf-8",
@@ -1163,7 +1622,7 @@ def export_video(job, config, emit):
         shutil.copyfile(video, output)
 
     elif config["export_mode"] == "soft":
-        emit("快速匯出字幕軌 / Fast export with selectable subtitle track")
+        emit("快速匯出字幕軌 / Exporting selectable subtitle track")
 
         ffmpeg([
             "-i", video,
@@ -1181,7 +1640,7 @@ def export_video(job, config, emit):
             output,
         ])
 
-    else:
+    elif config["export_mode"] == "burn":
         emit("永久燒錄字幕 / Burning subtitles into video")
 
         stream = next(
@@ -1210,6 +1669,9 @@ def export_video(job, config, emit):
             "-movflags", "+faststart",
             output,
         ], cwd=directory)
+
+    else:
+        raise ValueError("無效匯出模式 / Invalid export mode.")
 
     probe(output)
     downloads.insert(0, str(output))
